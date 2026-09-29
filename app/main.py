@@ -15,6 +15,9 @@ from .models import (
     ReceiptReconcileResponse,
     RevisionImpactRequest,
     RevisionImpactResponse,
+    RosterReconstructRequest,
+    RosterReconstructResponse,
+    RosterSelectedInterval,
     SeatAssignment,
     SeatPlanRequest,
     SeatPlanResponse,
@@ -32,6 +35,7 @@ from .splitter import (
     fare_envelope as compute_fare_envelope,
     plan_seats,
     reconcile_receipts,
+    reconstruct_roster,
     revision_impact as compute_revision_impact,
     settle_balances,
     split_fares,
@@ -39,7 +43,7 @@ from .splitter import (
 
 app = FastAPI(
     title="Carpool Fare Splitter",
-    version="1.2.0",
+    version="1.3.0",
     summary="Split a carpool trip's per-segment costs fairly between passengers.",
 )
 
@@ -254,4 +258,48 @@ def seat_plan(request: SeatPlanRequest) -> SeatPlanResponse:
         )
     return SeatPlanResponse(
         assignments=[SeatAssignment(id=pid, seat=seat) for pid, seat in assignments]
+    )
+
+
+@app.post(
+    "/roster-reconstruct",
+    response_model=RosterReconstructResponse,
+    responses={
+        409: {"description": "The request is valid but no per-passenger "
+                             "selection of one candidate interval reproduces "
+                             "the observed per-segment onboard counts"},
+        422: {"description": "Invalid request (duplicate id, empty candidate "
+                             "list, bad or out-of-range interval, positive-cost "
+                             "segment observed with zero onboard, unequal "
+                             "segment/load lengths, out-of-limits counts, "
+                             "malformed payload)"},
+    },
+)
+def roster_reconstruct(request: RosterReconstructRequest) -> RosterReconstructResponse:
+    rides, totals, details = reconstruct_roster(
+        request.segments, request.loads, request.passengers
+    )
+    if rides is None:
+        raise HTTPException(
+            status_code=409,
+            detail="no roster can be reconstructed: choosing exactly one "
+                   "candidate interval per passenger cannot reproduce the "
+                   "observed per-segment onboard counts",
+        )
+    return RosterReconstructResponse(
+        total_cost=sum(request.segments),
+        passengers=[
+            RosterSelectedInterval(id=r.id, board=r.board, alight=r.alight)
+            for r in rides
+        ],
+        totals={str(pid): amount for pid, amount in totals.items()},
+        segments=[
+            SegmentSplit(
+                index=d["index"],
+                cost=d["cost"],
+                passengers=d["passengers"],
+                shares={str(pid): amount for pid, amount in d["shares"].items()},
+            )
+            for d in details
+        ],
     )

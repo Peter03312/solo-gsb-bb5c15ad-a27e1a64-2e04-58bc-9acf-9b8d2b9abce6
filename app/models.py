@@ -670,3 +670,108 @@ class SeatPlanResponse(BaseModel):
                     "the seat-number sequence is lexicographically smallest among "
                     "all complete plans"
     )
+
+
+# --- roster reconstruction: recover each rider's interval from observed loads
+
+
+class RosterPassenger(BaseModel):
+    """One passenger with the candidate [board, alight) intervals they may have ridden."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: PassengerId = Field(description="unique passenger id (string or integer)")
+    candidates: List[List[NonNegativeInt]] = Field(
+        min_length=1,
+        max_length=6,
+        description="1 to 6 candidate ride intervals, each a [board, alight) "
+                    "pair of station indices with 0 <= board < alight <= segment "
+                    "count; exactly one is selected per passenger. Repeated "
+                    "intervals are harmless",
+    )
+
+
+class RosterReconstructRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    segments: List[NonNegativeInt] = Field(
+        min_length=1,
+        max_length=20,
+        description="integer cost of each segment in cents, in travel order",
+    )
+    loads: List[NonNegativeInt] = Field(
+        min_length=1,
+        description="observed number of passengers on board during each "
+                    "segment; same length and order as `segments`",
+    )
+    passengers: List[RosterPassenger] = Field(
+        min_length=1,
+        max_length=10,
+        description="1 to 10 passengers, each with 1 to 6 candidate "
+                    "[board, alight) intervals",
+    )
+
+    @model_validator(mode="after")
+    def _check_roster_reconstruction(self) -> "RosterReconstructRequest":
+        n = len(self.segments)
+        if len(self.loads) != n:
+            raise ValueError(
+                f"segments and loads must have equal length ({n} vs "
+                f"{len(self.loads)})"
+            )
+        seen = set()
+        for p in self.passengers:
+            key = str(p.id)
+            if key in seen:
+                raise ValueError(f"duplicate passenger id: {p.id!r}")
+            seen.add(key)
+            for interval in p.candidates:
+                if len(interval) != 2:
+                    raise ValueError(
+                        f"passenger {p.id!r}: candidate interval {interval!r} "
+                        f"must be a [board, alight) pair of exactly two stations"
+                    )
+                board, alight = interval
+                if board >= alight:
+                    raise ValueError(
+                        f"passenger {p.id!r}: invalid interval board={board}, "
+                        f"alight={alight} (board must be < alight)"
+                    )
+                if alight > n:
+                    raise ValueError(
+                        f"passenger {p.id!r}: alight station {alight} is out of "
+                        f"range; a trip with {n} segment(s) has stations 0..{n}"
+                    )
+        for i, cost in enumerate(self.segments):
+            if cost > 0 and self.loads[i] == 0:
+                raise ValueError(
+                    f"segment {i} has cost {cost} but the observed onboard "
+                    f"count is 0 (a positive-cost segment must carry passengers)"
+                )
+        return self
+
+
+class RosterSelectedInterval(BaseModel):
+    """The interval selected for one passenger."""
+
+    id: PassengerId = Field(description="passenger id")
+    board: NonNegativeInt = Field(description="selected boarding station")
+    alight: NonNegativeInt = Field(description="selected alighting station")
+
+
+class RosterReconstructResponse(BaseModel):
+    total_cost: NonNegativeInt = Field(description="sum of all segment costs in cents")
+    passengers: List[RosterSelectedInterval] = Field(
+        description="selected interval per passenger, in canonical id order "
+                    "(integer ids numerically, then string ids lexicographically); "
+                    "the (board, alight) sequence is lexicographically smallest "
+                    "(board compared first, then alight) among all solutions"
+    )
+    totals: Dict[str, NonNegativeInt] = Field(
+        description="cents charged to each passenger over the whole trip, "
+                    "computed with the same per-segment rules as /split; "
+                    "sums to total_cost"
+    )
+    segments: List[SegmentSplit] = Field(
+        description="per-segment split detail for the reconstructed roster"
+    )

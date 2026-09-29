@@ -1371,5 +1371,213 @@ class SeatPlanApiTests(unittest.TestCase):
         self.assertEqual(len(resp.json()["assignments"]), 10)
 
 
+class RosterReconstructApiTests(unittest.TestCase):
+    PAYLOAD = {
+        "segments": [100, 251, 80],
+        "loads": [2, 2, 2],
+        "passengers": [
+            {"id": "alice", "candidates": [[0, 3], [0, 2]]},
+            {"id": "bob", "candidates": [[1, 3], [0, 1]]},
+            {"id": "carol", "candidates": [[0, 1], [1, 2]]},
+        ],
+    }
+
+    def test_reconstruct_ok(self):
+        resp = client.post("/roster-reconstruct", json=self.PAYLOAD)
+        self.assertEqual(resp.status_code, 200, resp.text)
+        body = resp.json()
+        self.assertEqual(body["total_cost"], 431)
+        self.assertEqual(body["passengers"], [
+            {"id": "alice", "board": 0, "alight": 3},
+            {"id": "bob", "board": 1, "alight": 3},
+            {"id": "carol", "board": 0, "alight": 1},
+        ])
+        self.assertEqual(body["totals"],
+                         {"alice": 216, "bob": 165, "carol": 50})
+        self.assertEqual([s["passengers"] for s in body["segments"]],
+                         [["alice", "carol"], ["alice", "bob"], ["alice", "bob"]])
+
+    def test_reconstructed_split_matches_plain_split(self):
+        resp = client.post("/roster-reconstruct", json=self.PAYLOAD)
+        roster = [
+            {"id": p["id"], "board": p["board"], "alight": p["alight"]}
+            for p in resp.json()["passengers"]
+        ]
+        split = client.post("/split", json={
+            "segments": self.PAYLOAD["segments"], "passengers": roster,
+        })
+        self.assertEqual(split.status_code, 200, split.text)
+        plain = split.json()
+        body = resp.json()
+        self.assertEqual(body["totals"], plain["totals"])
+        self.assertEqual(
+            [{"index": s["index"], "cost": s["cost"],
+              "passengers": s["passengers"], "shares": s["shares"]}
+             for s in body["segments"]],
+            plain["segments"],
+        )
+
+    def test_lex_smallest_interval_sequence(self):
+        payload = {
+            "segments": [10, 10],
+            "loads": [1, 1],
+            "passengers": [
+                {"id": "b", "candidates": [[0, 1], [1, 2]]},
+                {"id": "a", "candidates": [[0, 2], [0, 1], [1, 2]]},
+            ],
+        }
+        body = client.post("/roster-reconstruct", json=payload).json()
+        self.assertEqual(body["passengers"], [
+            {"id": "a", "board": 0, "alight": 1},
+            {"id": "b", "board": 1, "alight": 2},
+        ])
+
+    def test_input_order_does_not_matter(self):
+        shuffled = {
+            **self.PAYLOAD,
+            "passengers": list(reversed(self.PAYLOAD["passengers"])),
+        }
+        for p in shuffled["passengers"]:
+            p["candidates"] = list(reversed(p["candidates"]))
+        a = client.post("/roster-reconstruct", json=self.PAYLOAD).json()
+        b = client.post("/roster-reconstruct", json=shuffled).json()
+        self.assertEqual(a, b)
+
+    def test_no_reconstruction_is_409(self):
+        payload = {
+            "segments": [100, 100],
+            "loads": [2, 2],
+            "passengers": [
+                {"id": "a", "candidates": [[0, 2]]},
+                {"id": "b", "candidates": [[0, 1], [0, 2]]},
+                {"id": "c", "candidates": [[0, 1]]},
+            ],
+        }
+        resp = client.post("/roster-reconstruct", json=payload)
+        self.assertEqual(resp.status_code, 409, resp.text)
+
+    def test_zero_cost_zero_load_segment_is_ok(self):
+        payload = {
+            "segments": [0, 100],
+            "loads": [0, 1],
+            "passengers": [{"id": "a", "candidates": [[0, 2], [1, 2]]}],
+        }
+        resp = client.post("/roster-reconstruct", json=payload)
+        self.assertEqual(resp.status_code, 200, resp.text)
+        self.assertEqual(resp.json()["passengers"],
+                         [{"id": "a", "board": 1, "alight": 2}])
+
+    def test_duplicate_id_is_422(self):
+        payload = {
+            "segments": [100], "loads": [2],
+            "passengers": [
+                {"id": "a", "candidates": [[0, 1]]},
+                {"id": "a", "candidates": [[0, 1]]},
+            ],
+        }
+        self.assertEqual(
+            client.post("/roster-reconstruct", json=payload).status_code, 422
+        )
+
+    def test_empty_candidates_is_422(self):
+        payload = {
+            "segments": [100], "loads": [1],
+            "passengers": [{"id": "a", "candidates": []}],
+        }
+        self.assertEqual(
+            client.post("/roster-reconstruct", json=payload).status_code, 422
+        )
+
+    def test_more_than_six_candidates_is_422(self):
+        payload = {
+            "segments": [100], "loads": [1],
+            "passengers": [{
+                "id": "a",
+                "candidates": [[0, 1], [0, 1], [0, 1], [0, 1], [0, 1],
+                               [0, 1], [0, 1]],
+            }],
+        }
+        self.assertEqual(
+            client.post("/roster-reconstruct", json=payload).status_code, 422
+        )
+
+    def test_bad_or_out_of_range_interval_is_422(self):
+        base = {"segments": [100, 100], "loads": [1, 1]}
+        cases = [
+            [{"id": "a", "candidates": [[1, 1]]}],
+            [{"id": "a", "candidates": [[2, 1]]}],
+            [{"id": "a", "candidates": [[0, 3]]}],
+            [{"id": "a", "candidates": [[-1, 1]]}],
+            [{"id": "a", "candidates": [[0]]}],
+            [{"id": "a", "candidates": [[0, 1, 2]]}],
+        ]
+        for passengers in cases:
+            resp = client.post("/roster-reconstruct",
+                               json={**base, "passengers": passengers})
+            self.assertEqual(resp.status_code, 422, passengers)
+
+    def test_positive_cost_segment_with_zero_load_is_422(self):
+        payload = {
+            "segments": [100, 0], "loads": [0, 0],
+            "passengers": [{"id": "a", "candidates": [[1, 2]]}],
+        }
+        self.assertEqual(
+            client.post("/roster-reconstruct", json=payload).status_code, 422
+        )
+
+    def test_loads_length_mismatch_is_422(self):
+        payload = {
+            "segments": [100, 100], "loads": [1],
+            "passengers": [{"id": "a", "candidates": [[0, 2]]}],
+        }
+        self.assertEqual(
+            client.post("/roster-reconstruct", json=payload).status_code, 422
+        )
+
+    def test_count_limits_and_malformed_requests_are_422(self):
+        good = {
+            "segments": [100], "loads": [1],
+            "passengers": [{"id": "a", "candidates": [[0, 1]]}],
+        }
+        cases = [
+            {"segments": [], "loads": [],
+             "passengers": [{"id": "a", "candidates": [[0, 1]]}]},
+            dict(good, segments=[100] * 21, loads=[1] * 21),
+            dict(good, passengers=[]),
+            dict(good, passengers=[
+                {"id": i, "candidates": [[0, 1]]} for i in range(11)
+            ]),
+            {k: v for k, v in good.items() if k != "loads"},
+            {k: v for k, v in good.items() if k != "passengers"},
+            dict(good, segments=[-1]),
+            dict(good, loads=[-1]),
+            dict(good, nope=True),
+        ]
+        for payload in cases:
+            resp = client.post("/roster-reconstruct", json=payload)
+            self.assertEqual(resp.status_code, 422, payload)
+
+    def test_max_limits_are_accepted(self):
+        n, m = 20, 10
+        rides = [(0, n)] * m
+        loads = [m] * n
+        payload = {
+            "segments": [100] * n,
+            "loads": loads,
+            "passengers": [
+                {"id": i, "candidates": [[0, n], [0, n - 1], [1, n],
+                                         [0, 1], [1, n - 1], [n - 1, n]]}
+                for i in range(m)
+            ],
+        }
+        resp = client.post("/roster-reconstruct", json=payload)
+        self.assertEqual(resp.status_code, 200, resp.text)
+        self.assertEqual(len(resp.json()["passengers"]), m)
+        self.assertTrue(
+            all(p["board"] == 0 and p["alight"] == n
+                for p in resp.json()["passengers"])
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

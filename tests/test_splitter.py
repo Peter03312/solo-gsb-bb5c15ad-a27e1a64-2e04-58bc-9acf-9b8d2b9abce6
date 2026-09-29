@@ -17,6 +17,7 @@ from app.splitter import (
     fare_envelope,
     plan_seats,
     reconcile_receipts,
+    reconstruct_roster,
     revision_impact,
     settle_balances,
     split_fares,
@@ -42,6 +43,10 @@ def cand(pid, board, alight, max_fare):
 
 def receipt(rid, amount, segments):
     return P(id=rid, amount=amount, segments=segments)
+
+
+def candidate_rider(pid, intervals):
+    return P(id=pid, candidates=[list(interval) for interval in intervals])
 
 
 class SplitFaresTests(unittest.TestCase):
@@ -1003,6 +1008,152 @@ class PlanSeatsTests(unittest.TestCase):
                 self.assertIsNone(result)
             else:
                 self.assertEqual([seat for _, seat in result], expected)
+
+
+class ReconstructRosterTests(unittest.TestCase):
+    def test_recovers_the_roster_and_splits_fares(self):
+        rides, totals, details = reconstruct_roster(
+            [100, 251, 80], [2, 2, 2],
+            [candidate_rider("bob", [(1, 3), (0, 1)]),
+             candidate_rider("carol", [(0, 1), (1, 2)]),
+             candidate_rider("alice", [(0, 3), (0, 2)])],
+        )
+        self.assertEqual(
+            [(r.id, r.board, r.alight) for r in rides],
+            [("alice", 0, 3), ("bob", 1, 3), ("carol", 0, 1)],
+        )
+        self.assertEqual(totals, {"alice": 216, "bob": 165, "carol": 50})
+        self.assertEqual(
+            [d["passengers"] for d in details],
+            [["alice", "carol"], ["alice", "bob"], ["alice", "bob"]],
+        )
+
+    def test_no_solution_returns_none(self):
+        rides, _, _ = reconstruct_roster(
+            [100], [2],
+            [candidate_rider("a", [(0, 1)]),
+             candidate_rider("b", [(0, 1)])],
+        )
+        self.assertIsNotNone(rides)
+        rides, _, _ = reconstruct_roster(
+            [100], [3],
+            [candidate_rider("a", [(0, 1)]),
+             candidate_rider("b", [(0, 1)])],
+        )
+        self.assertIsNone(rides)
+
+    def test_lex_smallest_interval_sequence_board_first(self):
+        # Two riders, loads [1,1]: one rides each segment. Board compared
+        # first, so the canonical-first rider takes the earlier board; when
+        # boards tie, the smaller alight wins.
+        rides, _, _ = reconstruct_roster(
+            [10, 10], [1, 1],
+            [candidate_rider("b", [(0, 1), (1, 2)]),
+             candidate_rider("a", [(0, 1), (1, 2), (0, 2)])],
+        )
+        self.assertEqual(
+            [(r.id, r.board, r.alight) for r in rides],
+            [("a", 0, 1), ("b", 1, 2)],
+        )
+
+    def test_lex_tie_broken_by_alight_when_boards_equal(self):
+        rides, _, _ = reconstruct_roster(
+            [10, 10], [1, 1],
+            [candidate_rider("a", [(0, 1), (0, 2)]),
+             candidate_rider("b", [(1, 2), (0, 2)])],
+        )
+        self.assertEqual(
+            [(r.id, r.board, r.alight) for r in rides],
+            [("a", 0, 1), ("b", 1, 2)],
+        )
+
+    def test_canonical_id_order_integers_before_strings(self):
+        rides, _, _ = reconstruct_roster(
+            [10, 10], [3, 2],
+            [candidate_rider("z", [(0, 2), (1, 2)]),
+             candidate_rider(2, [(0, 2), (0, 1)]),
+             candidate_rider(10, [(0, 2), (0, 1)]),
+             candidate_rider(1, [(0, 2), (0, 1)])],
+        )
+        self.assertEqual([r.id for r in rides], [1, 2, 10, "z"])
+        # loads [3,2]: three riders are aboard on segment 0, two on segment
+        # 1. z only rides [0,2) or [1,2); the lex-smallest matching sequence
+        # has 1 and 2 leave after segment 0, 10 ride the whole trip, and z
+        # board at station 1.
+        self.assertEqual(
+            [(r.board, r.alight) for r in rides],
+            [(0, 1), (0, 1), (0, 2), (1, 2)],
+        )
+
+    def test_input_order_and_duplicate_candidates_do_not_matter(self):
+        cands = [(2, 3), (0, 2), (0, 2)]
+        a = [candidate_rider("a", cands), candidate_rider("b", cands)]
+        b = [candidate_rider("b", list(reversed(cands))),
+             candidate_rider("a", list(reversed(cands)))]
+        ra, _, _ = reconstruct_roster([10, 10, 10], [2, 2, 0], a)
+        rb, _, _ = reconstruct_roster([10, 10, 10], [2, 2, 0], b)
+        self.assertEqual(
+            [(r.id, r.board, r.alight) for r in ra],
+            [(r.id, r.board, r.alight) for r in rb],
+        )
+        self.assertEqual(
+            [(r.board, r.alight) for r in ra], [(0, 2), (0, 2)]
+        )
+
+    def test_zero_cost_empty_load_segments_are_fine(self):
+        rides, totals, _ = reconstruct_roster(
+            [0, 100, 0], [0, 1, 0],
+            [candidate_rider("a", [(0, 3), (1, 2)])],
+        )
+        self.assertEqual([(r.board, r.alight) for r in rides], [(1, 2)])
+        self.assertEqual(totals, {"a": 100})
+
+    def test_random_against_brute_force(self):
+        import itertools
+
+        def brute(loads, riders):
+            ordered = sorted(riders, key=lambda p: tie_key(p.id))
+            domains = [sorted({tuple(c) for c in p.candidates})
+                       for p in ordered]
+            best = None
+            for combo in itertools.product(*domains):
+                cover = [0] * len(loads)
+                for board, alight in combo:
+                    for i in range(board, alight):
+                        cover[i] += 1
+                if cover == loads and (best is None or combo < best):
+                    best = combo
+            return best
+
+        rng = random.Random(2024)
+        for _ in range(400):
+            n = rng.randint(1, 5)
+            m = rng.randint(1, 4)
+            truth = []
+            for _ in range(m):
+                board = rng.randrange(n)
+                truth.append((board, rng.randint(board + 1, n)))
+            loads = [
+                sum(board <= i < alight for board, alight in truth)
+                for i in range(n)
+            ]
+            riders = []
+            for k in range(m):
+                pool = {truth[k]}
+                for _ in range(rng.randint(0, 4)):
+                    board = rng.randrange(n)
+                    pool.add((board, rng.randint(board + 1, n)))
+                riders.append(candidate_rider(str(k), pool))
+            segments = [rng.choice([0, 7, 13]) if loads[i] else 0
+                        for i in range(n)]
+            rides, _, _ = reconstruct_roster(segments, loads, riders)
+            expected = brute(loads, riders)
+            if expected is None:
+                self.assertIsNone(rides)
+            else:
+                self.assertEqual(
+                    tuple((r.board, r.alight) for r in rides), expected
+                )
 
 
 if __name__ == "__main__":

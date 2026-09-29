@@ -12,6 +12,7 @@ from fractions import Fraction
 from functools import lru_cache
 from itertools import combinations
 from math import factorial, gcd as _gcd
+from types import SimpleNamespace
 from typing import Dict, List, Optional, Tuple
 
 
@@ -924,3 +925,258 @@ def reconcile_receipts(segment_costs: List[int], receipts):
         for j in range(n_segments)
     ]
     return [r.id for r in ordered], assignment, segment_receipts
+
+
+# --- roster reconstruction: recover each rider's interval from observed loads
+
+
+def reconstruct_roster(segment_costs: List[int], loads: List[int], passengers):
+    """Recover the complete roster from per-segment observed onboard counts.
+
+    Each ``passengers`` item exposes ``id`` and ``candidates`` — a non-empty
+    list of ``[board, alight)`` intervals the passenger may have ridden.
+    Exactly one candidate interval must be chosen per passenger so that, for
+    every segment ``i``, the number of chosen intervals covering it equals
+    the observed ``loads[i]``.
+
+    Among all solutions the passengers are ordered by :func:`tie_key`
+    (integer ids numerically first, then string ids lexicographically), and
+    the lexicographically smallest sequence of ``(board, alight)`` pairs
+    (board compared first, then alight) is returned. The request order never
+    affects the result.
+
+    Returns ``(rides, totals, details)`` where ``rides`` is a list of
+    :class:`types.SimpleNamespace` objects with ``id``/``board``/``alight``
+    in canonical id order and ``totals``/``details`` are the
+    :func:`split_fares` result for that roster. Returns ``(None, None, None)``
+    when the request is valid but no interval selection matches the loads.
+    """
+    ordered = sorted(passengers, key=lambda p: tie_key(p.id))
+    m = len(ordered)
+    n_segments = len(segment_costs)
+    n_stations = n_segments + 1
+
+    # Unique candidate intervals per passenger, sorted by (board, alight) so
+    # the first feasible extension is the lexicographically smallest one.
+    # Each option carries its segment-cover bitmask.
+    options = []
+    masks = []
+    for p in ordered:
+        intervals = sorted({(int(b), int(a)) for b, a in p.candidates})
+        options.append(intervals)
+        masks.append(tuple(sum(1 << i for i in range(b, a)) for b, a in intervals))
+
+    # A domain state is one option-bitmask per passenger (bit j set means
+    # option j is still possible). Exact segment covers are cardinality
+    # constraints: observed load[i] passengers cover segment i.
+    full_domains = tuple((1 << len(masks[k])) - 1 for k in range(m))
+    seg_bits = [1 << i for i in range(n_segments)]
+    # Net onboard change at each station: +1 boardings minus alightments.
+    # loads[-1] = 0 (nobody aboard before station 0), loads[n] = 0 (every
+    # rider has alighted at the final station).
+    net_target = [
+        (loads[s] if s < n_segments else 0)
+        - (loads[s - 1] if s > 0 else 0)
+        for s in range(n_stations)
+    ]
+
+    def propagate(domains):
+        """Prune options by arc consistency over all segment/station constraints.
+
+        Returns the reduced domain tuple, or ``None`` as soon as the state is
+        infeasible. Segment constraints are exact cardinalities: passengers
+        whose every remaining option covers a segment must cover it, those
+        whose none do cannot, and tight bounds force flexible passengers'
+        options. Station constraints bound the net onboard change (boards
+        minus alights) by the per-option min/max contribution.
+        """
+        domains = list(domains)
+
+        def current_sets():
+            cover = [0] * n_segments  # covers forced by singleton domains
+            undecided = []
+            for k, dom in enumerate(domains):
+                if dom == 0:
+                    return None
+                if dom & (dom - 1) == 0:
+                    mk = masks[k][dom.bit_length() - 1]
+                    for i in range(n_segments):
+                        if mk & seg_bits[i]:
+                            cover[i] += 1
+                else:
+                    undecided.append(k)
+            return cover, undecided
+
+        # Repeat the two pruning phases until quiescence; any domain shrink
+        # restarts the pass so both phases always see current domains.
+        restart = True
+        while restart:
+            restart = False
+            result = current_sets()
+            if result is None:
+                return None
+            cover, undecided = result
+
+            for i, bit in enumerate(seg_bits):
+                need = loads[i] - cover[i]
+                must = never = 0
+                covers_by_k = {}
+                for k in undecided:
+                    covers = [
+                        j for j in range(len(masks[k]))
+                        if domains[k] & (1 << j) and masks[k][j] & bit
+                    ]
+                    covers_by_k[k] = covers
+                    dom_count = domains[k].bit_count()
+                    if len(covers) == dom_count:
+                        must += 1
+                    elif not covers:
+                        never += 1
+                flexible = len(undecided) - must - never
+                if need < must or need > must + flexible:
+                    return None
+                if not flexible:
+                    continue
+                for k in undecided:
+                    dom = domains[k]
+                    dom_count = dom.bit_count()
+                    covers = covers_by_k[k]
+                    if not covers or len(covers) == dom_count:
+                        continue
+                    if need == must:
+                        # No flexible passenger may cover this segment.
+                        new_dom = dom
+                        for j in covers:
+                            new_dom &= ~(1 << j)
+                    elif need == must + flexible:
+                        # Every flexible passenger must cover it.
+                        new_dom = sum(1 << j for j in covers)
+                    else:
+                        continue
+                    if new_dom != dom:
+                        if new_dom == 0:
+                            return None
+                        domains[k] = new_dom
+                        restart = True
+                        break
+                if restart:
+                    break
+
+            if restart:
+                continue
+
+            # Station net-change bounds (boards minus alights at a station).
+            for s, target in enumerate(net_target):
+                fixed_net = 0
+                for k, dom in enumerate(domains):
+                    if dom & (dom - 1) == 0:
+                        board, alight = options[k][dom.bit_length() - 1]
+                        fixed_net += (1 if board == s else 0) - (1 if alight == s else 0)
+                need = target - fixed_net
+                lo = hi = 0
+                contributions = {}
+                for k in undecided:
+                    vals = set()
+                    dom = domains[k]
+                    for j in range(len(masks[k])):
+                        if dom & (1 << j):
+                            board, alight = options[k][j]
+                            vals.add((1 if board == s else 0)
+                                     - (1 if alight == s else 0))
+                    vmin, vmax = min(vals), max(vals)
+                    lo += vmin
+                    hi += vmax
+                    contributions[k] = (vmin, vmax)
+                if need < lo or need > hi:
+                    return None
+                if need == lo or need == hi:
+                    # The aggregate bound is tight, so every remaining
+                    # contribution must equal its own minimum (need == lo)
+                    # or its own maximum (need == hi).
+                    at_minimum = need == lo
+                    for k, (vmin, vmax) in contributions.items():
+                        forced = vmin if at_minimum else vmax
+                        dom = domains[k]
+                        new_dom = 0
+                        for j in range(len(masks[k])):
+                            if dom & (1 << j):
+                                board, alight = options[k][j]
+                                val = (1 if board == s else 0) - (1 if alight == s else 0)
+                                if val == forced:
+                                    new_dom |= 1 << j
+                        if new_dom != dom:
+                            if new_dom == 0:
+                                return None
+                            domains[k] = new_dom
+                            restart = True
+                            break
+                    if restart:
+                        break
+
+        return tuple(domains)
+
+    @lru_cache(maxsize=None)
+    def feasible(domains) -> bool:
+        """Whether every undecided domain extends to an exact load match."""
+        domains = propagate(domains)
+        if domains is None:
+            return False
+        if all(dom & (dom - 1) == 0 for dom in domains):
+            cover = [0] * n_segments
+            for k, dom in enumerate(domains):
+                mk = masks[k][dom.bit_length() - 1]
+                for i in range(n_segments):
+                    if mk & seg_bits[i]:
+                        cover[i] += 1
+            return cover == loads
+        # Branch on the smallest non-singleton domain (MRV).
+        k = min(
+            (k for k in range(m) if domains[k] & (domains[k] - 1)),
+            key=lambda k: domains[k].bit_count(),
+        )
+        dom = domains[k]
+        while dom:
+            bit = dom & -dom
+            dom ^= bit
+            trial = list(domains)
+            trial[k] = bit
+            if feasible(tuple(trial)):
+                return True
+        return False
+
+    # Fix passengers in canonical id order, always trying intervals in
+    # (board, alight) order and keeping a choice iff a completion exists:
+    # the first full sequence reached is the lexicographically smallest.
+    chosen: List[Optional[int]] = [None] * m
+    current = full_domains
+    for k in range(m):
+        selected = None
+        dom = current[k]
+        for j in range(len(options[k])):
+            if not (dom & (1 << j)):
+                continue
+            trial = list(current)
+            trial[k] = 1 << j
+            if feasible(tuple(trial)):
+                selected = j
+                break
+        if selected is None:
+            return None, None, None
+        chosen[k] = selected
+        reduced = propagate(
+            tuple(1 << selected if t == k else current[t] for t in range(m))
+        )
+        if reduced is None:
+            return None, None, None
+        current = reduced
+
+    rides = [
+        SimpleNamespace(
+            id=ordered[k].id,
+            board=options[k][chosen[k]][0],
+            alight=options[k][chosen[k]][1],
+        )
+        for k in range(m)
+    ]
+    totals, details = split_fares(segment_costs, rides)
+    return rides, totals, details

@@ -11,7 +11,9 @@
 多方案时取字典序最小的归属序列），并同时给出逐人应付额；
 以及为 1～10 名乘客**编排固定座位**（每人全程固定一个「允许且未停用」的座位，
 区间重叠者不可同座、下车站可立即换客，多方案时取规范编号顺序下座位编号序列字典序最小者，
-无解返回 409）。
+无解返回 409）；还可在录入行程时只有逐路段在车人数、每位乘客仅剩若干候选上下车区间的情况下，
+**还原完整乘车名单**（每人恰选一个候选 `[board, alight)` 区间使各段覆盖人数精确吻合，
+多解时取规范 ID 顺序下区间序列字典序最小者），并直接给出同一套逐段分摊结果。
 金额全程使用整数分与精确分数计算，总额严格守恒，且乘客、凭证与付款记录的输入顺序不影响结果。
 
 ## 快速启动
@@ -33,10 +35,11 @@ docker compose up --build
 | http://localhost:8000/fare-envelope | 两段费用未定时的应付额包络接口（POST） |
 | http://localhost:8000/receipt-reconcile | 凭证整额核销 + 分摊接口（POST） |
 | http://localhost:8000/seat-plan | 固定座位编排接口（POST，无解返回 409） |
+| http://localhost:8000/roster-reconstruct | 候选区间还原乘车名单 + 分摊接口（POST，无法还原返回 409） |
 | http://localhost:8000/docs | Swagger 交互式文档（各 POST 接口可在此直接发请求） |
 | http://localhost:8000/healthz | 健康检查 |
 
-以上 `/split`、`/admit`、`/settle`、`/revision-impact`、`/fare-envelope`、`/receipt-reconcile`、`/seat-plan` 均为 **POST** 接口，浏览器地址栏直接访问只适用于 GET；命令行可用下文的 `curl` 示例（带 `-d` 请求体即按 POST 发送），或打开 `/docs` 在页面上交互式调用。
+以上 `/split`、`/admit`、`/settle`、`/revision-impact`、`/fare-envelope`、`/receipt-reconcile`、`/seat-plan`、`/roster-reconstruct` 均为 **POST** 接口，浏览器地址栏直接访问只适用于 GET；命令行可用下文的 `curl` 示例（带 `-d` 请求体即按 POST 发送），或打开 `/docs` 在页面上交互式调用。
 
 后台运行可加 `-d`；停止用 `docker compose down`。
 
@@ -574,6 +577,101 @@ curl -s http://localhost:8000/seat-plan \
   -d '{"station_count":3,"seat_count":2,"passengers":[{"id":"a","board":0,"alight":1,"allowed_seats":[1,2]},{"id":"b","board":0,"alight":2,"allowed_seats":[1,2]},{"id":"c","board":1,"alight":2,"allowed_seats":[1,2]}]}'
 ```
 
+## API：`POST /roster-reconstruct`
+
+行程录入时，现场只保留了**逐路段在车人数** `loads`，而每位乘客的上下车站可能只剩
+**若干候选区间**。本接口为每位乘客从其候选中**恰好选择一个** `[board, alight)` 区间
+（站点编号约定与 `/split` 完全一致：`N` 段对应站点 `0..N`），使每个路段被选中区间
+覆盖的人数**精确等于**该段的观测值；还原出完整名单后，直接复用 `/split` 的
+「逐段累计欠额分摊」规则给出各人应付总额与逐路段明细。
+
+规模：**最多 10 名乘客、20 段**，每人 **1～6 个**候选区间（重复候选无害）。
+
+### 多解取舍
+
+满足观测人数的选择可能不止一组。先把乘客按**规范 ID 顺序**排列
+（整数 ID 按数值升序、排在字符串 ID 前，字符串按字典序升序），再在所有可行选择中取
+**`(board, alight)` 区间序列字典序最小**者——先比较 `board`，`board` 相同再比较 `alight`。
+因此乘客及其候选区间在请求中的排列顺序**不影响结果**。
+
+### 请求体
+
+```json
+{
+  "segments": [100, 251, 80],
+  "loads": [2, 2, 2],
+  "passengers": [
+    {"id": "alice", "candidates": [[0, 3], [0, 2]]},
+    {"id": "bob",   "candidates": [[1, 3], [0, 1]]},
+    {"id": "carol", "candidates": [[0, 1], [1, 2]]}
+  ]
+}
+```
+
+- `segments`：逐路段费用，整数分，规则同 `/split`（≥ 0，1～20 段）。
+- `loads`：与 `segments` **等长**的逐段观测在车人数，非负整数。
+- `passengers[].id`：乘客 ID（字符串或整数），全程唯一；1～10 人。
+- `passengers[].candidates`：**1～6 个**候选区间，每个为 `[board, alight)` 两元素数组，
+  规则同 `/split`：`0 ≤ board < alight ≤ 路段数`。
+- 任一**正费用**路段的观测人数为 0 属无效输入（等价于空载收费路段）；费用为 0 且
+  观测人数为 0 的路段允许。
+
+### 响应（200）
+
+```json
+{
+  "total_cost": 431,
+  "passengers": [
+    {"id": "alice", "board": 0, "alight": 3},
+    {"id": "bob", "board": 1, "alight": 3},
+    {"id": "carol", "board": 0, "alight": 1}
+  ],
+  "totals": {"alice": 216, "bob": 165, "carol": 50},
+  "segments": [
+    {"index": 0, "cost": 100, "passengers": ["alice", "carol"], "shares": {"alice": 50, "carol": 50}},
+    {"index": 1, "cost": 251, "passengers": ["alice", "bob"],   "shares": {"alice": 126, "bob": 125}},
+    {"index": 2, "cost": 80,  "passengers": ["alice", "bob"],   "shares": {"alice": 40, "bob": 40}}
+  ]
+}
+```
+
+- `passengers`：每人被选中的区间，按规范 ID 顺序排列；区间序列为全部可行解中的
+  字典序最小者。
+- `totals` / `segments`：对还原出的完整名单调用与 `/split` **完全相同**的分摊规则的结果，
+  结构也与 `/split` 一致（`totals` 之和恒等于 `total_cost`，每段 `shares` 之和恒等于该段费用）。
+  把返回的 `passengers` 作为 `/split` 的输入会得到完全一致的金额与明细。
+
+### 无解（409）与非法输入（422）
+
+输入本身合法，但不存在「每人恰选一个候选区间、各段覆盖人数恰好等于观测值」的选择时，
+返回 **409 Conflict**，`detail` 说明无法还原：
+
+```json
+{"detail": "no roster can be reconstructed: ..."}
+```
+
+以下情况返回 **422 Unprocessable Entity**：乘客 ID 重复、`candidates` 为空或超过 6 个、
+候选区间不是两元素数组、`board >= alight`、站点越界（`alight > 路段数` 或为负）、
+`segments` 为空或超过 20 段、乘客超过 10 人、`loads` 与 `segments` 长度不等、
+某正费用路段观测人数为 0、费用/人数为负或非整数、字段缺失或含未知字段。
+
+### 算法：基数约束传播 + MRV 记忆化回溯
+
+每个乘客是一个取值为候选区间的变量，每个路段是一条「覆盖该段的人数恰为 `loads[i]`」的
+基数约束；此外由相邻路段人数差可得到每个站点的**净在车变化**（上车人数减下车人数）界。
+回溯前先做不动点式约束传播：把已确定为单值的变量计入各段覆盖，对每条路段计算必选/必不选
+人数，在界取等时删除（或强制）相关候选；站点净变化界取等时同理按每变量的最小/最大贡献剪枝。
+仍无法确定时，在记忆化状态上按最小剩余域（MRV）分支。最终按规范 ID 顺序逐位固定乘客、
+候选区间按 `(board, alight)` 升序尝试，第一个能补全的选择即字典序最小完整方案。
+
+### 示例
+
+```bash
+curl -s http://localhost:8000/roster-reconstruct \
+  -H 'Content-Type: application/json' \
+  -d '{"segments":[100,251,80],"loads":[2,2,2],"passengers":[{"id":"alice","candidates":[[0,3],[0,2]]},{"id":"bob","candidates":[[1,3],[0,1]]},{"id":"carol","candidates":[[0,1],[1,2]]}]}'
+```
+
 ## 分摊规则
 
 1. 按路段顺序处理，每段找出全部在车乘客均摊：`base = cost // n`，余数 `r = cost % n`。
@@ -611,11 +709,16 @@ curl -s http://localhost:8000/seat-plan \
 - （仅 `/seat-plan`）乘客或停用区间非法（`board >= alight`、`alight > station_count-1`、
   站点为负）、乘客 ID 重复、`allowed_seats` 为空或含 `1..seat_count` 之外的座位号，
   或 `blocked` 项的座位号越界、停用区间非法；
-- （仅 `/seat-plan`）含未知字段、字段缺失或类型错误。
+- （仅 `/seat-plan`）含未知字段、字段缺失或类型错误；
+- （仅 `/roster-reconstruct`）`loads` 与 `segments` 长度不等、候选区间为空或超过 6 个、
+  候选不是合法 `[board, alight)` 区间、乘客超过 10 人或路段超过 20 段、
+  正费用路段的观测在车人数为 0。
 
-`POST /seat-plan` 另有 **409 Conflict**：输入完全合法、但**不存在可行座位方案**
-（例如某乘客的所有允许座位在其在车区间内均被停用，或区间重叠的乘客无法分散到各自允许的座位）。
-422 表示输入本身非法，409 表示「合法但排不下」，两者严格区分。
+`POST /seat-plan` 与 `POST /roster-reconstruct` 另有 **409 Conflict**：前者表示输入完全合法、
+但**不存在可行座位方案**（例如某乘客的所有允许座位在其在车区间内均被停用，或区间重叠的
+乘客无法分散到各自允许的座位）；后者表示输入完全合法、但**不存在一组每人一个候选区间的
+选择可以精确复现逐路段观测人数**。422 表示输入本身非法，409 表示「合法但排不出/还原不出」，
+两者严格区分。
 
 ## 本地开发与测试
 
@@ -631,9 +734,9 @@ uvicorn app.main:app --reload    # 本地起服务，默认 http://127.0.0.1:800
 
 ```
 app/
-  main.py       # FastAPI 应用与路由（POST /split、/admit、/settle、/revision-impact、/fare-envelope、/receipt-reconcile、/seat-plan、GET /healthz）
+  main.py       # FastAPI 应用与路由（POST /split、/admit、/settle、/revision-impact、/fare-envelope、/receipt-reconcile、/seat-plan、/roster-reconstruct、GET /healthz）
   models.py     # 请求/响应模型与 422 校验规则
-  splitter.py   # 核心算法：分摊（精确分数）+ 候选遴选（子集枚举）+ 最少转账结清（子集 DP）+ 修订影响（Shapley 平均边际）+ 费用包络（余数周期压缩）+ 凭证核销（从左到右子集 DP）+ 座位编排（贪心 + 记忆化可行性回溯）
+  splitter.py   # 核心算法：分摊（精确分数）+ 候选遴选（子集枚举）+ 最少转账结清（子集 DP）+ 修订影响（Shapley 平均边际）+ 费用包络（余数周期压缩）+ 凭证核销（从左到右子集 DP）+ 座位编排（贪心 + 记忆化可行性回溯）+ 名单还原（基数约束传播 + MRV 记忆化回溯）
 tests/          # 算法单元测试 + API 集成测试
 Dockerfile      # 依赖与启动命令均固化在镜像内
 compose.yaml    # 单服务编排，含健康检查
