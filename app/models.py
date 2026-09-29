@@ -670,3 +670,127 @@ class SeatPlanResponse(BaseModel):
                     "the seat-number sequence is lexicographically smallest among "
                     "all complete plans"
     )
+
+
+# --- roster restoration: recover rides from per-segment on-board counts
+
+
+class RosterInterval(BaseModel):
+    """One candidate half-open ride interval [board, alight)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    board: NonNegativeInt = Field(description="candidate boarding station index")
+    alight: NonNegativeInt = Field(description="candidate alighting station index")
+
+
+class RosterCandidate(BaseModel):
+    """One passenger with the few ride intervals they could have taken."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: PassengerId = Field(description="unique passenger id (string or integer)")
+    candidates: List[RosterInterval] = Field(
+        min_length=1,
+        max_length=6,
+        description="1 to 6 candidate [board, alight) intervals; exactly one is "
+                    "chosen. Repeats collapse to one candidate and are harmless.",
+    )
+
+    @field_validator("candidates")
+    @classmethod
+    def _dedupe_candidates(cls, intervals: List[RosterInterval]) -> List[RosterInterval]:
+        # Keep first-seen order; only the (board, alight) set matters downstream.
+        seen = set()
+        unique = []
+        for interval in intervals:
+            key = (interval.board, interval.alight)
+            if key not in seen:
+                seen.add(key)
+                unique.append(interval)
+        return unique
+
+
+class RestoreRosterRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    segments: List[NonNegativeInt] = Field(
+        min_length=1,
+        max_length=20,
+        description="integer cost of each segment in cents, in travel order",
+    )
+    loads: List[NonNegativeInt] = Field(
+        min_length=1,
+        description="observed number of passengers on board each segment; one "
+                    "non-negative integer per segment, same length and order as "
+                    "`segments`",
+    )
+    passengers: List[RosterCandidate] = Field(
+        min_length=1,
+        max_length=10,
+        description="1 to 10 passengers, each with a unique id and 1 to 6 "
+                    "candidate [board, alight) intervals",
+    )
+
+    @model_validator(mode="after")
+    def _check_restore(self) -> "RestoreRosterRequest":
+        n = len(self.segments)
+        if len(self.loads) != n:
+            raise ValueError(
+                f"loads must have one entry per segment ({len(self.loads)} "
+                f"loads for {n} segments)"
+            )
+        seen = set()
+        for p in self.passengers:
+            key = str(p.id)
+            if key in seen:
+                raise ValueError(f"duplicate passenger id: {p.id!r}")
+            seen.add(key)
+            for interval in p.candidates:
+                if interval.board >= interval.alight:
+                    raise ValueError(
+                        f"passenger {p.id!r}: invalid candidate interval "
+                        f"board={interval.board}, alight={interval.alight} "
+                        f"(board must be < alight)"
+                    )
+                if interval.alight > n:
+                    raise ValueError(
+                        f"passenger {p.id!r}: candidate alight station "
+                        f"{interval.alight} is out of range; a trip with {n} "
+                        f"segment(s) has stations 0..{n}"
+                    )
+        for i, (cost, load) in enumerate(zip(self.segments, self.loads)):
+            if cost > 0 and load == 0:
+                raise ValueError(
+                    f"segment {i} has cost {cost} but the observed load is 0 "
+                    f"(empty-load charged segment)"
+                )
+        return self
+
+
+class RestoredPassenger(BaseModel):
+    """One passenger with the interval chosen by the restoration."""
+
+    id: PassengerId = Field(description="passenger id")
+    board: NonNegativeInt = Field(description="chosen boarding station index")
+    alight: NonNegativeInt = Field(description="chosen alighting station index")
+
+
+class RestoreRosterResponse(BaseModel):
+    total_cost: NonNegativeInt = Field(description="sum of all segment costs in cents")
+    loads: List[NonNegativeInt] = Field(
+        description="observed on-board counts, echoed back in segment order"
+    )
+    roster: List[RestoredPassenger] = Field(
+        description="one entry per passenger in canonical id order "
+                    "(integer ids numerically, then string ids lexicographically); "
+                    "the interval sequence is lexicographically smallest among all "
+                    "restorations (board first, then alight)"
+    )
+    totals: Dict[str, NonNegativeInt] = Field(
+        description="cents charged to each passenger over the whole trip, split "
+                    "with the usual /split rules; sums to total_cost"
+    )
+    segments: List[SegmentSplit] = Field(
+        description="per-segment split detail of the restored trip"
+    )

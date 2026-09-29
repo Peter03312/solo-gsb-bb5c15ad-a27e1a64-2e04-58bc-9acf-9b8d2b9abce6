@@ -17,6 +17,7 @@ from app.splitter import (
     fare_envelope,
     plan_seats,
     reconcile_receipts,
+    restore_roster,
     revision_impact,
     settle_balances,
     split_fares,
@@ -42,6 +43,10 @@ def cand(pid, board, alight, max_fare):
 
 def receipt(rid, amount, segments):
     return P(id=rid, amount=amount, segments=segments)
+
+
+def roster_cand(pid, intervals):
+    return P(id=pid, candidates=[tuple(iv) for iv in intervals])
 
 
 class SplitFaresTests(unittest.TestCase):
@@ -1003,6 +1008,229 @@ class PlanSeatsTests(unittest.TestCase):
                 self.assertIsNone(result)
             else:
                 self.assertEqual([seat for _, seat in result], expected)
+
+
+class RestoreRosterTests(unittest.TestCase):
+    def test_restore_unique_solution_and_split(self):
+        passengers = [
+            roster_cand("a", [[0, 3], [0, 2]]),
+            roster_cand("b", [[1, 3], [0, 3]]),
+            roster_cand("c", [[0, 1], [2, 3]]),
+        ]
+        chosen, totals, details = restore_roster(
+            [100, 251, 80], [2, 2, 1], passengers
+        )
+        self.assertEqual(chosen, {"a": (0, 2), "b": (1, 3), "c": (0, 1)})
+        # The restored roster splits exactly like an explicit /split call.
+        self.assertEqual(
+            totals,
+            split_fares([100, 251, 80], [
+                ride("a", 0, 2), ride("b", 1, 3), ride("c", 0, 1)
+            ])[0],
+        )
+        self.assertEqual([d["passengers"] for d in details],
+                         [["a", "c"], ["a", "b"], ["b"]])
+
+    def test_chosen_intervals_match_observed_loads(self):
+        passengers = [
+            roster_cand("a", [[0, 3], [1, 3]]),
+            roster_cand("b", [[0, 3], [1, 3]]),
+            roster_cand("c", [[0, 1], [2, 3]]),
+        ]
+        loads = [2, 2, 3]
+        chosen, totals, _ = restore_roster([10, 10, 10], loads, passengers)
+        for i, observed in enumerate(loads):
+            self.assertEqual(
+                sum(b <= i < a for b, a in chosen.values()), observed
+            )
+        # Lex-min: a=[0,3) beats [1,3); with a full and c=[2,3), segment 0
+        # demands b=[0,3), giving coverage [2,2,3].
+        self.assertEqual(
+            chosen, {"a": (0, 3), "b": (0, 3), "c": (2, 3)}
+        )
+        self.assertEqual(sum(totals.values()), 30)
+
+    def test_lex_min_board_before_alight(self):
+        # Loads [1,2,3] have two restorations: (a full, b late, c late) and
+        # (a late, b full, c late). Canonical id order fixes a first, and the
+        # smaller board 0 wins regardless of input ordering.
+        passengers = [
+            roster_cand("c", [[2, 3]]),
+            roster_cand("a", [[1, 3], [0, 3]]),  # reverse input order
+            roster_cand("b", [[0, 3], [1, 3]]),
+        ]
+        chosen, _, _ = restore_roster([10, 10, 10], [1, 2, 3], passengers)
+        self.assertEqual(chosen, {"a": (0, 3), "b": (1, 3), "c": (2, 3)})
+
+    def test_lex_min_alight_when_board_ties(self):
+        # Same board 0 for a's two options; the shorter interval comes first
+        # (alight compared second).
+        chosen, _, _ = restore_roster(
+            [10, 10], [1, 1],
+            [roster_cand("a", [[0, 2], [0, 1]]),
+             roster_cand("b", [[1, 2]])],
+        )
+        self.assertEqual(chosen, {"a": (0, 1), "b": (1, 2)})
+
+    def test_lookahead_needed_for_lex_min(self):
+        # The locally smallest interval for a ([0,1)) leaves segment 1 with
+        # only b covering it while loads demand 2 there, so it must be skipped
+        # in favour of [0,2).
+        chosen, _, _ = restore_roster(
+            [10, 10], [2, 2],
+            [roster_cand("a", [[0, 1], [0, 2]]),
+             roster_cand("b", [[0, 2]])],
+        )
+        self.assertEqual(chosen, {"a": (0, 2), "b": (0, 2)})
+
+    def test_duplicate_candidate_intervals_are_harmless(self):
+        chosen, totals, _ = restore_roster(
+            [10], [1],
+            [roster_cand("a", [[0, 1], [0, 1]])],
+        )
+        self.assertEqual(chosen, {"a": (0, 1)})
+        self.assertEqual(totals, {"a": 10})
+
+    def test_zero_cost_empty_segment_ok(self):
+        chosen, totals, details = restore_roster(
+            [0, 50], [0, 1], [roster_cand("a", [[1, 2], [0, 2]])]
+        )
+        self.assertEqual(chosen, {"a": (1, 2)})
+        self.assertEqual(totals, {"a": 50})
+        self.assertEqual(details[0]["passengers"], [])
+
+    def test_infeasible_raises(self):
+        with self.assertRaises(ValueError):
+            restore_roster(
+                [10], [0], [roster_cand("a", [[0, 1]])]
+            )
+        # observed load exceeds the number of passengers listed
+        with self.assertRaises(ValueError):
+            restore_roster(
+                [10], [2], [roster_cand("a", [[0, 1]])]
+            )
+        # total demand that no interval combination can cover
+        with self.assertRaises(ValueError):
+            restore_roster(
+                [10, 10], [1, 0],
+                [roster_cand("a", [[0, 2]]), roster_cand("b", [[0, 2]])],
+            )
+
+    def test_input_order_independent(self):
+        passengers = [
+            roster_cand("z", [[0, 1], [0, 2]]),
+            roster_cand(10, [[1, 2]]),
+            roster_cand(2, [[0, 2]]),
+        ]
+        expected = None
+        for ordering in permutations(passengers):
+            chosen, totals, _ = restore_roster(
+                [10, 10], [2, 2], list(ordering)
+            )
+            result = (list(chosen), totals)
+            if expected is None:
+                expected = result
+            self.assertEqual(result, expected)
+        # integer ids first, then string ids
+        self.assertEqual(list(expected[0]), [2, 10, "z"])
+
+    def test_length_mismatch_raises(self):
+        with self.assertRaises(ValueError):
+            restore_roster(
+                [10, 10], [1], [roster_cand("a", [[0, 2]])]
+            )
+
+    def test_random_against_brute_force(self):
+        import itertools
+
+        rng = random.Random(404)
+        for _ in range(200):
+            n = rng.randint(1, 5)
+            m = rng.randint(1, 5)
+            # Build the true rides first, derive their loads, then hand each
+            # passenger a superset of candidate intervals.
+            rides = []
+            for k in range(m):
+                board = rng.randint(0, n - 1)
+                alight = rng.randint(board + 1, n)
+                rides.append((k if k % 2 else f"p{k}", board, alight))
+            loads = [0] * n
+            for _, board, alight in rides:
+                for i in range(board, alight):
+                    loads[i] += 1
+            passengers = []
+            for pid, board, alight in rides:
+                domain = {(board, alight)}
+                for _ in range(rng.randint(0, 3)):
+                    b2 = rng.randint(0, n - 1)
+                    a2 = rng.randint(b2 + 1, n)
+                    domain.add((b2, a2))
+                passengers.append(roster_cand(pid, sorted(domain)))
+
+            costs = [rng.randint(0, 20) if load else 0 for load in loads]
+
+            ordered = sorted(passengers, key=lambda p: tie_key(p.id))
+            domains = [sorted({tuple(iv) for iv in p.candidates})
+                       for p in ordered]
+            brute_best = None
+            for combo in itertools.product(*domains):
+                covered = [0] * n
+                for b, a in combo:
+                    for i in range(b, a):
+                        covered[i] += 1
+                if covered == loads:
+                    seq = list(combo)
+                    if brute_best is None or seq < brute_best:
+                        brute_best = seq
+            self.assertIsNotNone(brute_best)  # the true rides are always a sol
+
+            chosen, totals, details = restore_roster(costs, loads, passengers)
+            got = [chosen[p.id] for p in ordered]
+            self.assertEqual(got, brute_best)
+            self.assertEqual(sum(totals.values()), sum(costs))
+            for i, observed in enumerate(loads):
+                self.assertEqual(len(details[i]["passengers"]), observed)
+
+    def test_random_infeasibility_against_brute_force(self):
+        import itertools
+
+        rng = random.Random(909)
+        for _ in range(200):
+            n = rng.randint(1, 4)
+            m = rng.randint(1, 4)
+            passengers = []
+            for k in range(m):
+                domain = set()
+                for _ in range(rng.randint(1, 4)):
+                    b2 = rng.randint(0, n - 1)
+                    a2 = rng.randint(b2 + 1, n)
+                    domain.add((b2, a2))
+                passengers.append(
+                    roster_cand(k if k % 2 else f"q{k}", sorted(domain))
+                )
+            loads = [rng.randint(0, m) for _ in range(n)]
+
+            ordered = sorted(passengers, key=lambda p: tie_key(p.id))
+            domains = [sorted({tuple(iv) for iv in p.candidates})
+                       for p in ordered]
+            feasible = False
+            for combo in itertools.product(*domains):
+                covered = [0] * n
+                for b, a in combo:
+                    for i in range(b, a):
+                        covered[i] += 1
+                if covered == loads:
+                    feasible = True
+                    break
+
+            if feasible:
+                costs = [rng.randint(0, 20) if load else 0
+                         for load in loads]
+                chosen, totals, _ = restore_roster(costs, loads, passengers)
+                self.assertEqual(sum(totals.values()), sum(costs))
+            else:
+                with self.assertRaises(ValueError):
+                    restore_roster([0] * n, loads, passengers)
 
 
 if __name__ == "__main__":

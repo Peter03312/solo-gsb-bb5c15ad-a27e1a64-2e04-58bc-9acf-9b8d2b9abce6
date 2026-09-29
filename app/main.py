@@ -13,6 +13,9 @@ from .models import (
     ReceiptAssignment,
     ReceiptReconcileRequest,
     ReceiptReconcileResponse,
+    RestoredPassenger,
+    RestoreRosterRequest,
+    RestoreRosterResponse,
     RevisionImpactRequest,
     RevisionImpactResponse,
     SeatAssignment,
@@ -32,6 +35,7 @@ from .splitter import (
     fare_envelope as compute_fare_envelope,
     plan_seats,
     reconcile_receipts,
+    restore_roster,
     revision_impact as compute_revision_impact,
     settle_balances,
     split_fares,
@@ -39,7 +43,7 @@ from .splitter import (
 
 app = FastAPI(
     title="Carpool Fare Splitter",
-    version="1.2.0",
+    version="1.3.0",
     summary="Split a carpool trip's per-segment costs fairly between passengers.",
 )
 
@@ -254,4 +258,46 @@ def seat_plan(request: SeatPlanRequest) -> SeatPlanResponse:
         )
     return SeatPlanResponse(
         assignments=[SeatAssignment(id=pid, seat=seat) for pid, seat in assignments]
+    )
+
+
+@app.post(
+    "/restore-roster",
+    response_model=RestoreRosterResponse,
+    responses={
+        409: {"description": "Valid request, but the roster cannot be "
+                             "restored: no choice of one candidate interval per "
+                             "passenger reproduces the observed on-board counts"},
+        422: {"description": "Invalid request (duplicate id, empty candidate "
+                             "list, bad or out-of-range interval, loads/segments "
+                             "length mismatch, positive-cost segment observed "
+                             "with load 0, counts out of limits, malformed payload)"},
+    },
+)
+def restore_roster_route(request: RestoreRosterRequest) -> RestoreRosterResponse:
+    try:
+        chosen, totals, details = restore_roster(
+            request.segments,
+            request.loads,
+            request.passengers,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    return RestoreRosterResponse(
+        total_cost=sum(request.segments),
+        loads=list(request.loads),
+        roster=[
+            RestoredPassenger(id=pid, board=interval[0], alight=interval[1])
+            for pid, interval in chosen.items()
+        ],
+        totals={str(pid): amount for pid, amount in totals.items()},
+        segments=[
+            SegmentSplit(
+                index=d["index"],
+                cost=d["cost"],
+                passengers=d["passengers"],
+                shares={str(pid): amount for pid, amount in d["shares"].items()},
+            )
+            for d in details
+        ],
     )

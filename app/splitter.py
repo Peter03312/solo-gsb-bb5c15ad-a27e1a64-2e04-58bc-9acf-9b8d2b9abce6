@@ -12,7 +12,7 @@ from fractions import Fraction
 from functools import lru_cache
 from itertools import combinations
 from math import factorial, gcd as _gcd
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, NamedTuple, Optional, Tuple
 
 
 def tie_key(passenger_id) -> tuple:
@@ -924,3 +924,222 @@ def reconcile_receipts(segment_costs: List[int], receipts):
         for j in range(n_segments)
     ]
     return [r.id for r in ordered], assignment, segment_receipts
+
+
+# --- roster restoration: recover who rode, from per-segment on-board counts
+
+
+class RosterPassenger(NamedTuple):
+    """One restored passenger: their id with the chosen ride interval."""
+
+    id: object
+    board: int
+    alight: int
+
+
+def restore_roster(segment_costs: List[int], loads: List[int], passengers):
+    """Recover every passenger's ride interval from per-segment head counts.
+
+    ``segment_costs`` are the integer-cent per-segment costs; ``loads`` is an
+    equal-length list of observed, non-negative numbers of passengers on board
+    each segment. Each ``passengers`` item exposes ``id`` and a ``candidates``
+    list of ``(board, alight)`` half-open intervals (the same
+    ``board <= i < alight`` convention as :func:`split_fares`; station numbers
+    must stay within the trip). Exactly one candidate interval per passenger
+    must be chosen so that, on every segment, the number of chosen intervals
+    covering it equals the observed load.
+
+    When several restorations exist, passengers are taken in canonical id
+    order (:func:`tie_key`) and the lexicographically smallest sequence of
+    chosen intervals — comparing ``board`` first, then ``alight`` — is taken,
+    so the request's input order never affects the result.
+
+    Raises ``ValueError`` when no choice of intervals reproduces the observed
+    loads (empty candidates and out-of-range intervals are assumed to be
+    rejected earlier, during request validation).
+
+    Returns ``(chosen, totals, details)``: ``chosen`` maps each passenger id
+    to ``(board, alight)`` in canonical id order, and ``totals``/``details``
+    are the :func:`split_fares` result for the restored roster.
+    """
+    n_segments = len(segment_costs)
+    if len(loads) != n_segments:
+        raise ValueError(
+            f"loads must have one entry per segment ({len(loads)} loads for "
+            f"{n_segments} segments)"
+        )
+
+    ordered = sorted(passengers, key=lambda p: tie_key(p.id))
+    m = len(ordered)
+
+    def interval_pair(interval):
+        """Accept (board, alight) tuples or objects exposing those attrs."""
+        if isinstance(interval, (tuple, list)):
+            return (int(interval[0]), int(interval[1]))
+        return (int(interval.board), int(interval.alight))
+
+    # Per passenger, deduplicated candidates sorted by (board, alight); this
+    # is the order the lexicographic tie-break scans, ascending. Each
+    # interval is also a bitmask of the segments it covers.
+    options: List[List[Tuple[int, int]]] = [
+        sorted({interval_pair(iv) for iv in p.candidates}) for p in ordered
+    ]
+    masks: List[List[int]] = [
+        [sum(1 << i for i in range(board, alight)) for board, alight in opts]
+        for opts in options
+    ]
+    # cov[k][i]: bitmask of passenger k's *option* indices whose interval
+    # covers segment i. Domains themselves are option-bitmasks (at most 6
+    # options), so propagation is pure integer bit twiddling.
+    cov: List[List[int]] = [
+        [
+            sum(1 << idx for idx, seg_mask in enumerate(masks[k])
+                if seg_mask & (1 << i))
+            for i in range(n_segments)
+        ]
+        for k in range(m)
+    ]
+
+    @lru_cache(maxsize=None)
+    def feasible(unfixed: int, remaining) -> bool:
+        """Whether the still-unfixed passengers can exactly cover ``remaining``.
+
+        ``remaining`` is the residual per-segment head-count tuple. Search is
+        generalized-arc-consistency propagation for one global cardinality
+        constraint per segment (each segment needs exactly ``remaining[i]``
+        of the unfixed passengers on it), iterated to a fixpoint:
+
+        * let ``coverers`` be passengers with at least one surviving option
+          covering segment i and ``forced`` those whose every surviving option
+          covers it; feasibility requires
+          ``#forced <= remaining[i] <= #coverers``;
+        * when ``remaining[i] == #coverers`` every coverer is forced on
+          (options avoiding i are dropped);
+        * when ``remaining[i] == #forced`` every non-forced passenger is
+          forced off (options covering i are dropped).
+
+        The passenger with the fewest surviving options is branched on then
+        (minimum remaining values). Domains never exceed 6 options and there
+        are at most 10 passengers, so the memoized state space stays small
+        even at the 10-passenger/20-segment limit.
+        """
+        if unfixed == 0:
+            return not any(remaining)
+
+        full_domain = (1 << 6) - 1  # option masks are 6 bits wide at most
+        domain = [
+            (1 << len(options[k])) - 1 if unfixed & (1 << k) else 0
+            for k in range(m)
+        ]
+        active = unfixed
+        changed = True
+        while changed:
+            changed = False
+            for i in range(n_segments):
+                seg_bit = 1 << i
+                coverer_mask = 0
+                forced_mask = 0
+                j = active
+                while j:
+                    k_bit = j & -j
+                    k = k_bit.bit_length() - 1
+                    j ^= k_bit
+                    covers = domain[k] & cov[k][i]
+                    if covers:
+                        coverer_mask |= k_bit
+                        if covers == domain[k]:
+                            forced_mask |= k_bit
+                need = remaining[i]
+                n_coverers = coverer_mask.bit_count()
+                n_forced = forced_mask.bit_count()
+                if need < 0 or n_forced > need or need > n_coverers:
+                    return False
+                if need == n_coverers:
+                    # Every passenger who can cover i actually must cover it.
+                    j = coverer_mask
+                    while j:
+                        k_bit = j & -j
+                        k = k_bit.bit_length() - 1
+                        j ^= k_bit
+                        new_domain = domain[k] & cov[k][i]
+                        if new_domain != domain[k]:
+                            domain[k] = new_domain
+                            changed = True
+                elif need == n_forced:
+                    # Nobody outside the already-forced set may cover i.
+                    j = active & ~forced_mask
+                    while j:
+                        k_bit = j & -j
+                        k = k_bit.bit_length() - 1
+                        j ^= k_bit
+                        new_domain = domain[k] & (full_domain ^ cov[k][i])
+                        if new_domain != domain[k]:
+                            if new_domain == 0:
+                                return False
+                            domain[k] = new_domain
+                            changed = True
+
+        best_k = -1
+        best_size = 7
+        j = active
+        while j:
+            k_bit = j & -j
+            k = k_bit.bit_length() - 1
+            j ^= k_bit
+            size = domain[k].bit_count()
+            if size < best_size:
+                best_k, best_size = k, size
+                if size == 1:
+                    break
+
+        d = domain[best_k]
+        while d:
+            opt_bit = d & -d
+            d ^= opt_bit
+            idx = opt_bit.bit_length() - 1
+            board, alight = options[best_k][idx]
+            nxt = list(remaining)
+            for i in range(board, alight):
+                nxt[i] -= 1
+            if feasible(unfixed ^ (1 << best_k), tuple(nxt)):
+                return True
+        return False
+
+    target = tuple(loads)
+    all_passengers = (1 << m) - 1
+    if not feasible(all_passengers, target):
+        raise ValueError(
+            "no roster restoration reproduces the observed on-board loads: "
+            "no choice of one candidate interval per passenger covers each "
+            "segment with exactly the observed number of passengers"
+        )
+
+    # Fix passengers in canonical id order, always trying intervals ascending
+    # (smallest board, then smallest alight) and keeping the first whose
+    # coverage leaves a residual the unprocessed passengers can cover. Every
+    # fixed position is therefore the smallest one admitting a completion,
+    # so the full interval sequence is lexicographically minimal.
+    chosen: List[Tuple[int, int]] = []
+    remaining = target
+    unfixed = all_passengers
+    for k in range(m):
+        for idx, (board, alight) in enumerate(options[k]):
+            trial = list(remaining)
+            for i in range(board, alight):
+                trial[i] -= 1
+            if (min(trial) >= 0
+                    and feasible(unfixed ^ (1 << k), tuple(trial))):
+                chosen.append((board, alight))
+                remaining = tuple(trial)
+                unfixed ^= 1 << k
+                break
+        else:  # pragma: no cover - feasible(all, target) guarantees a completion
+            raise ValueError("no roster restoration reproduces the observed loads")
+
+    roster = [
+        RosterPassenger(ordered[k].id, chosen[k][0], chosen[k][1])
+        for k in range(m)
+    ]
+    chosen_by_id = {ordered[k].id: chosen[k] for k in range(m)}
+    totals, details = split_fares(segment_costs, roster)
+    return chosen_by_id, totals, details

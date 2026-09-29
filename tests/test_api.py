@@ -1371,5 +1371,161 @@ class SeatPlanApiTests(unittest.TestCase):
         self.assertEqual(len(resp.json()["assignments"]), 10)
 
 
+class RestoreRosterApiTests(unittest.TestCase):
+    PAYLOAD = {
+        "segments": [100, 251, 80],
+        "loads": [2, 2, 1],
+        "passengers": [
+            {"id": "c", "candidates": [
+                {"board": 0, "alight": 1}, {"board": 2, "alight": 3}]},
+            {"id": "a", "candidates": [
+                {"board": 0, "alight": 3}, {"board": 0, "alight": 2}]},
+            {"id": "bob", "candidates": [
+                {"board": 1, "alight": 3}, {"board": 0, "alight": 3}]},
+        ],
+    }
+
+    def test_restore_ok(self):
+        resp = client.post("/restore-roster", json=self.PAYLOAD)
+        self.assertEqual(resp.status_code, 200, resp.text)
+        body = resp.json()
+        self.assertEqual(body["total_cost"], 431)
+        self.assertEqual(body["loads"], [2, 2, 1])
+        self.assertEqual(body["roster"], [
+            {"id": "a", "board": 0, "alight": 2},
+            {"id": "bob", "board": 1, "alight": 3},
+            {"id": "c", "board": 0, "alight": 1},
+        ])
+        self.assertEqual(body["totals"], {"a": 176, "bob": 205, "c": 50})
+        self.assertEqual(sum(body["totals"].values()), 431)
+        for seg, load in zip(body["segments"], body["loads"]):
+            self.assertEqual(len(seg["passengers"]), load)
+            self.assertEqual(sum(seg["shares"].values()), seg["cost"])
+        self.assertEqual(body["segments"][0]["passengers"], ["a", "c"])
+        self.assertEqual(body["segments"][2]["passengers"], ["bob"])
+
+    def test_input_order_does_not_matter(self):
+        shuffled = {
+            **self.PAYLOAD,
+            "passengers": list(reversed(self.PAYLOAD["passengers"])),
+        }
+        r1 = client.post("/restore-roster", json=self.PAYLOAD)
+        r2 = client.post("/restore-roster", json=shuffled)
+        self.assertEqual(r1.json(), r2.json())
+
+    def test_duplicate_candidate_interval_is_accepted(self):
+        payload = {
+            "segments": [10],
+            "loads": [1],
+            "passengers": [{"id": "a", "candidates": [
+                {"board": 0, "alight": 1}, {"board": 0, "alight": 1}]}],
+        }
+        resp = client.post("/restore-roster", json=payload)
+        self.assertEqual(resp.status_code, 200, resp.text)
+        self.assertEqual(resp.json()["roster"],
+                         [{"id": "a", "board": 0, "alight": 1}])
+
+    def test_zero_cost_segment_with_zero_load_is_ok(self):
+        payload = {
+            "segments": [0, 50],
+            "loads": [0, 1],
+            "passengers": [{"id": "a", "candidates": [
+                {"board": 1, "alight": 2}]}],
+        }
+        resp = client.post("/restore-roster", json=payload)
+        self.assertEqual(resp.status_code, 200, resp.text)
+        self.assertEqual(resp.json()["totals"], {"a": 50})
+
+    def test_no_restoration_is_409(self):
+        # valid input, but no interval choice reproduces the observed loads
+        payload = {
+            "segments": [100, 0],
+            "loads": [1, 1],
+            "passengers": [{"id": "a", "candidates": [
+                {"board": 0, "alight": 1}]}],
+        }
+        resp = client.post("/restore-roster", json=payload)
+        self.assertEqual(resp.status_code, 409)
+        self.assertIn("no roster restoration", resp.text)
+
+    def test_load_exceeding_passenger_count_is_409(self):
+        payload = {
+            "segments": [100],
+            "loads": [2],
+            "passengers": [{"id": "a", "candidates": [
+                {"board": 0, "alight": 1}]}],
+        }
+        self.assertEqual(client.post("/restore-roster", json=payload).status_code, 409)
+
+    def test_invalid_inputs_are_422(self):
+        good = self.PAYLOAD
+        cases = [
+            dict(good, loads=[2, 2]),  # length mismatch
+            dict(good, loads=[2, 2, -1, 0]),  # negative load
+            dict(good, segments=[100, 251], loads=[2, 2]),  # both short
+            # empty candidate list
+            {"segments": [10], "loads": [1],
+             "passengers": [{"id": "a", "candidates": []}]},
+            # board >= alight
+            {"segments": [10], "loads": [1],
+             "passengers": [{"id": "a", "candidates": [
+                 {"board": 1, "alight": 1}]}]},
+            # alight out of range
+            {"segments": [10], "loads": [1],
+             "passengers": [{"id": "a", "candidates": [
+                 {"board": 0, "alight": 2}]}]},
+            # positive-cost segment observed empty
+            {"segments": [10], "loads": [0],
+             "passengers": [{"id": "a", "candidates": [
+                 {"board": 0, "alight": 1}]}]},
+            # duplicate passenger ids
+            {"segments": [10], "loads": [1],
+             "passengers": [
+                 {"id": "a", "candidates": [{"board": 0, "alight": 1}]},
+                 {"id": "a", "candidates": [{"board": 0, "alight": 1}]}]},
+            # more than 6 candidates (trip with 7 distinct unit segments)
+            {"segments": [10] * 7, "loads": [1] * 7,
+             "passengers": [{"id": "a", "candidates": [
+                 {"board": i, "alight": i + 1} for i in range(7)]}]},
+            # 11 passengers
+            {"segments": [10], "loads": [1],
+             "passengers": [
+                 {"id": i, "candidates": [{"board": 0, "alight": 1}]}
+                 for i in range(11)]},
+            # empty trip
+            {"segments": [], "loads": [], "passengers": []},
+            # missing fields / unknown field
+            {k: v for k, v in good.items() if k != "loads"},
+            dict(good, nope=True),
+        ]
+        for payload in cases:
+            self.assertEqual(
+                client.post("/restore-roster", json=payload).status_code, 422,
+                payload,
+            )
+
+    def test_max_limits_are_accepted(self):
+        # 10 passengers, 20 segments, 6 candidates each; unit rides give
+        # exact loads (two riders on segment 0, one on segments 1..8).
+        passengers = []
+        for i in range(10):
+            board = i // 2  # boards 0,0,1,1,...,4,4
+            passengers.append({
+                "id": i,
+                "candidates": [
+                    {"board": board, "alight": board + 1} for _ in range(6)
+                ],
+            })
+        loads = [0] * 20
+        for p in passengers:
+            loads[p["candidates"][0]["board"]] += 1
+        costs = [10 if load else 0 for load in loads]
+        payload = {"segments": costs, "loads": loads,
+                   "passengers": passengers}
+        resp = client.post("/restore-roster", json=payload)
+        self.assertEqual(resp.status_code, 200, resp.text)
+        self.assertEqual(len(resp.json()["roster"]), 10)
+
+
 if __name__ == "__main__":
     unittest.main()
